@@ -1,0 +1,17 @@
+node_modules/
+dist/
+.DS_Store
+*.local
+.vite/
+coverage/
+
+# 账单原始文件绝不入库（含个人财务数据）
+*.xlsx
+*.xls
+*.csv
+# 引用本机真实账单路径的校验脚本，同样不入库
+*.local.test.ts
+
+# 工作区记忆（含个人财务分析结论），绝不入库
+.workbuddy/
+deliverables/
