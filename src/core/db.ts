@@ -180,3 +180,21 @@ export async function destroyVault(): Promise<void> {
     await db.imports.clear()
   })
 }
+
+/**
+ * 只丢掉信封和数据体，**保留旧版明文表**。
+ *
+ * 用于 setupVault 的自检失败回滚：那时密文已经提交进库了，如果直接抛错走人，
+ * 用户会卡在「有信封但解不开」的状态，重试也只会被告知「已经有一个保险箱了」。
+ * 回滚掉信封和数据体之后，重试就是一条真正能走通的路 —— 而且明文还在，
+ * 最坏情况下数据一条没少。
+ *
+ * 刻意不用 destroyVault()：那个连明文表一起清，在「加密还没被验证成功」的时候
+ * 清掉明文，正好是这套设计里唯一不可挽回的失败模式。
+ */
+export async function discardVaultRecords(): Promise<void> {
+  await db.transaction('rw', db.meta, db.vault, async () => {
+    await db.meta.clear()
+    await db.vault.clear()
+  })
+}

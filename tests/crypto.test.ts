@@ -21,9 +21,11 @@ import {
   normalizeRecoveryCode,
   open,
   openJson,
+  openPaddedJson,
   randomBytes,
   seal,
   sealJson,
+  sealPaddedJson,
   toB64,
 } from '../src/core/crypto'
 
@@ -322,5 +324,83 @@ describe('恢复码', () => {
     const fromTyping = await deriveKek(normalizeRecoveryCode(typed), params)
     const recovered = await open(fromTyping, wrapped, AAD_DEK)
     expect(Array.from(new Uint8Array(recovered))).toEqual(Array.from(rawDek))
+  })
+})
+
+/**
+ * 带填充的封装。存在的唯一理由是 GCM 不填充 —— 密文长度 = 明文长度，
+ * 所以不处理的话，备份文件的大小能直接反推出里面有多少条账单。
+ */
+describe('填充封装（防长度泄漏）', () => {
+  const PAD_FLOOR = 32 * 1024
+  /**
+   * GCM 会在密文末尾追加 16 字节认证标签，所以 密文长度 = 填充后的明文长度 + 16。
+   * 这不影响防泄漏性质 —— 桶仍然是离散的，同一桶里的负载密文长度完全相同 ——
+   * 但它意味着「密文长度是 2 的幂」这个直觉是错的，断言必须减掉这 16 字节。
+   */
+  const GCM_TAG = 16
+
+  it('小负载也被填到分档下限', async () => {
+    const dek = await newDek()
+    const sealed = await sealPaddedJson(dek, { a: 1 }, AAD_VAULT)
+    expect(fromB64(sealed.ct).length).toBe(PAD_FLOOR + GCM_TAG)
+  })
+
+  it('条数不同但同档位的两份数据，密文长度一模一样 —— 看不出谁多谁少', async () => {
+    const dek = await newDek()
+    const make = (n: number) => ({ rows: Array.from({ length: n }, (_, i) => ({ id: i, note: 'x' })) })
+
+    const one = await sealPaddedJson(dek, make(1), AAD_VAULT)
+    const fifty = await sealPaddedJson(dek, make(50), AAD_VAULT)
+
+    // 1 条和 50 条的明文差几十倍，但密文长度完全相同
+    expect(fromB64(one.ct).length).toBe(fromB64(fifty.ct).length)
+  })
+
+  it('跨档时只暴露数量级，不暴露准确条数', async () => {
+    const dek = await newDek()
+    const big = await sealPaddedJson(
+      dek,
+      { rows: new Array(3000).fill(0).map((_, i) => ({ id: i, n: '字'.repeat(30) })) },
+      AAD_VAULT,
+    )
+    const padded = fromB64(big.ct).length - GCM_TAG
+    expect(Number.isInteger(Math.log2(padded))).toBe(true)
+    expect(padded).toBeGreaterThan(PAD_FLOOR)
+  })
+
+  it('中文字段往返无损，填充字节不会被当成正文', async () => {
+    const dek = await newDek()
+    const value = { 备注: '楼下便利店 · 酸奶', 金额: 12.5, 空数组: [], 嵌套: { a: [1, 2] } }
+    const sealed = await sealPaddedJson(dek, value, AAD_BACKUP)
+    expect(await openPaddedJson(dek, sealed, AAD_BACKUP)).toEqual(value)
+  })
+
+  it('填充不影响篡改检测', async () => {
+    const dek = await newDek()
+    const sealed = await sealPaddedJson(dek, { a: 1 }, AAD_VAULT)
+    const bytes = fromB64(sealed.ct)
+    // 改填充区（末尾的零字节）也要能被 GCM 的认证标签抓到
+    bytes[bytes.length - 1] ^= 0x01
+    await expect(openPaddedJson(dek, { iv: sealed.iv, ct: toB64(bytes) }, AAD_VAULT)).rejects.toThrow()
+  })
+
+  it('长度前缀与实际内容不符时报错，不会静默返回半截 JSON', async () => {
+    const dek = await newDek()
+    // 必须用 seal() 手工造一个「认证标签有效、但长度前缀撒谎」的密文 ——
+    // 直接改已加密的字节会先被 GCM 拦下，根本走不到长度校验那一步
+    const body = new TextEncoder().encode('{"a":1}')
+    const buf = new Uint8Array(256)
+    new DataView(buf.buffer).setUint32(0, 0xffffffff, false)
+    buf.set(body, 4)
+    const sealed = await seal(dek, buf, AAD_VAULT)
+
+    await expect(openPaddedJson(dek, sealed, AAD_VAULT)).rejects.toThrow(/长度前缀/)
+  })
+
+  it('AAD 不匹配仍然解不开', async () => {
+    const dek = await newDek()
+    const sealed = await sealPaddedJson(dek, { a: 1 }, AAD_VAULT)
+    await expect(openPaddedJson(dek, sealed, AAD_BACKUP)).rejects.toThrow()
   })
 })

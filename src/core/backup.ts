@@ -5,8 +5,8 @@ import {
   deriveKek,
   makeVerifier,
   newKdfParams,
-  openJson,
-  sealJson,
+  openPaddedJson,
+  sealPaddedJson,
   type KdfParams,
   type Sealed,
 } from './crypto'
@@ -80,7 +80,9 @@ export async function buildEncryptedBackup(payload: VaultPayload, password: stri
     exportedOn: today(),
     kdf,
     verifier: await makeVerifier(kek),
-    payload: await sealJson(
+    // 带填充封装：GCM 不填充，密文长度 = 明文长度，不处理的话文件大小能反推出条数。
+    // 填到 2 的幂之后，同档位的备份在外部看起来一样大。
+    payload: await sealPaddedJson(
       kek,
       { txns: payload.txns, snapshots: payload.snapshots, imports: payload.imports },
       AAD_BACKUP,
@@ -175,7 +177,7 @@ export async function openBackupFile(file: File, password: string): Promise<Open
 
     let payload: VaultPayload
     try {
-      payload = await openJson<VaultPayload>(kek, backup.payload, AAD_BACKUP)
+      payload = await openPaddedJson<VaultPayload>(kek, backup.payload, AAD_BACKUP)
     } catch {
       throw new Error('密码是对的，但数据体解不开，说明这个文件在传输或存放过程中被改动过。换一份备份试试。')
     }

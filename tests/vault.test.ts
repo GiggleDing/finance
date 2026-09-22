@@ -4,7 +4,7 @@ import { mkTxn } from './helpers'
 import {
   AAD_VAULT,
   fromB64,
-  openJson,
+  openPaddedJson,
   importDekRaw,
 } from '../src/core/crypto'
 import {
@@ -13,7 +13,7 @@ import {
   probeBackupFile,
   type EncryptedBackup,
 } from '../src/core/backup'
-import { db, readEnvelope, readVaultBlob, type VaultPayload } from '../src/core/db'
+import { db, readEnvelope, readVaultBlob, discardVaultRecords, type VaultPayload } from '../src/core/db'
 import {
   WRONG_PASSWORD_MESSAGE,
   appendTxns,
@@ -21,13 +21,17 @@ import {
   changePassword,
   currentPayload,
   destroyEverything,
+  hasRecoveryCode,
   hasSessionKey,
   lock,
   mergeFromBackup,
+  reissueRecoveryCode,
   replaceSnapshots,
   resetPasswordWithRecoveryCode,
   setupVault,
   unlock,
+  vaultFacts,
+  verifyPassword,
   getVaultState,
   wipeVaultData,
 } from '../src/core/session'
@@ -483,7 +487,9 @@ describe('DEK 与信封的一致性', () => {
     const raw = await currentDekRawForTest()
     const dek = await importDekRaw(raw)
     const blob = await readVaultBlob()
-    const decrypted = await openJson<VaultPayload>(dek, blob!.sealed, AAD_VAULT)
+    // 数据体是带填充封装的，必须用 openPaddedJson 解 —— 用 openJson 会先撞见
+    // 4 字节长度前缀和尾部填充，报「不是合法 JSON」
+    const decrypted = await openPaddedJson<VaultPayload>(dek, blob!.sealed, AAD_VAULT)
     expect(decrypted.txns.map((t) => t.id)).toEqual(['a'])
   })
 })
@@ -515,3 +521,192 @@ function indexOfBytes(haystack: Uint8Array, needle: Uint8Array): number {
   }
   return -1
 }
+
+/* ═══════════ 以下为独立验证发现的问题的回归测试 ═══════════ */
+
+describe('写入串行化（防「导入了却显示没有」）', () => {
+  it('两次导入同时发起，两份账单都要在', async () => {
+    await setupVault('Trombone7Melon')
+
+    const a = [mkTxn({ id: 'a1', time: '2026-03-01 10:00:00', rawType: '支出', amount: 1 })]
+    const b = [mkTxn({ id: 'b1', time: '2026-03-02 10:00:00', rawType: '支出', amount: 2 })]
+
+    // 不 await 第一次就发起第二次 —— 相当于用户连着往页面里拖两份文件。
+    // 不做串行化的话，两次都会基于「空库」加密，后写的把先写的整个覆盖掉，
+    // 表现就是「导入成功、界面也刷新了，但只剩一份账单」。
+    const [ra, rb] = await Promise.all([appendTxns(a), appendTxns(b)])
+
+    expect(ra.inserted + rb.inserted).toBe(2)
+    expect(currentPayload().txns.map((t) => t.id).sort()).toEqual(['a1', 'b1'])
+  })
+
+  it('三次并发写入的结果是可累加的，不会互相吞', async () => {
+    await setupVault('Trombone7Melon')
+    await Promise.all([
+      appendTxns([mkTxn({ id: 'x', time: '2026-03-01 10:00:00', rawType: '支出', amount: 1 })]),
+      replaceSnapshots([{ date: '2026-03-31', name: '招行', balance: 7, group: '资金', includeInNet: true }]),
+      appendTxns([mkTxn({ id: 'y', time: '2026-03-03 10:00:00', rawType: '支出', amount: 3 })]),
+    ])
+    expect(currentPayload().txns.map((t) => t.id).sort()).toEqual(['x', 'y'])
+    expect(currentPayload().snapshots).toHaveLength(1)
+  })
+})
+
+describe('恢复备份时的快照语义', () => {
+  const localSnap = { date: '2026-03-31', name: '招行', balance: 100, group: '资金' as const, includeInNet: true }
+
+  it('备份里有快照 → 整表替换，并回报 replaced', async () => {
+    await setupVault('Trombone7Melon')
+    await replaceSnapshots([localSnap, { ...localSnap, name: '工行' }])
+
+    const r = await mergeFromBackup({
+      txns: [],
+      snapshots: [{ date: '2026-04-30', name: '招行', balance: 999, group: '资金', includeInNet: true }],
+      imports: [],
+    })
+
+    expect(r.snapshotsAction).toBe('replaced')
+    expect(r.snapshotsRestored).toBe(1)
+    expect(currentPayload().snapshots).toHaveLength(1)
+    expect(currentPayload().snapshots[0].balance).toBe(999)
+  })
+
+  it('备份里没有快照 → 本机快照原样不动，但必须如实回报', async () => {
+    await setupVault('Trombone7Melon')
+    await replaceSnapshots([localSnap, { ...localSnap, name: '工行' }])
+
+    const r = await mergeFromBackup({ txns: [], snapshots: [], imports: [] })
+
+    // 这是本次修的关键：结果不能是「悄悄保留」。
+    // 不说的话，用户会以为看到的余额来自刚恢复的那份备份。
+    expect(r.snapshotsAction).toBe('kept-local')
+    expect(r.localSnapshotsKept).toBe(2)
+    expect(r.snapshotsRestored).toBe(0)
+    expect(currentPayload().snapshots).toHaveLength(2)
+  })
+
+  it('两边都没有快照 → 回报 none', async () => {
+    await setupVault('Trombone7Melon')
+    const r = await mergeFromBackup({ txns: [], snapshots: [], imports: [] })
+    expect(r.snapshotsAction).toBe('none')
+    expect(r.localSnapshotsKept).toBe(0)
+  })
+
+  it('流水仍然只合并不覆盖，重复 ID 不会翻倍', async () => {
+    await setupVault('Trombone7Melon')
+    await appendTxns([mkTxn({ id: 'keep', time: '2026-03-01 10:00:00', rawType: '支出', amount: 1 })])
+
+    const r = await mergeFromBackup({
+      txns: [
+        mkTxn({ id: 'keep', time: '2026-03-01 10:00:00', rawType: '支出', amount: 1 }),
+        mkTxn({ id: 'new', time: '2026-03-05 10:00:00', rawType: '支出', amount: 5 }),
+      ],
+      snapshots: [],
+      imports: [],
+    })
+    expect(r.txnsInserted).toBe(1)
+    expect(r.txnsDuplicated).toBe(1)
+    expect(currentPayload().txns).toHaveLength(2)
+  })
+})
+
+describe('长度不泄漏条数', () => {
+  it('1 笔和 50 笔的库，密文长度完全相同', async () => {
+    await setupVault('Trombone7Melon')
+    await appendTxns([mkTxn({ id: 'a', time: '2026-03-01 10:00:00', rawType: '支出', amount: 1, note: '备注' })])
+    const one = (await readVaultBlob())!.sealed.ct.length
+
+    await appendTxns(
+      Array.from({ length: 50 }, (_, i) =>
+        mkTxn({ id: `m${i}`, time: '2026-03-01 10:00:00', rawType: '支出', amount: 1 + i, note: '备注' }),
+      ),
+    )
+    const many = (await readVaultBlob())!.sealed.ct.length
+
+    // 不做填充的话这里会差几十倍，裸看 IndexedDB 就知道你记了多少笔账
+    expect(many).toBe(one)
+  })
+
+  it('1 笔和 50 笔导出的备份文件，大小也完全相同', async () => {
+    await setupVault('Trombone7Melon')
+    const t = (id: string) => mkTxn({ id, time: '2026-03-01 10:00:00', rawType: '支出', amount: 1, note: '备注' })
+
+    await appendTxns([t('a')])
+    const small = JSON.stringify(await buildEncryptedBackup(currentPayload(), 'Backup9Password'))
+
+    await appendTxns(Array.from({ length: 50 }, (_, i) => t(`m${i}`)))
+    const large = JSON.stringify(await buildEncryptedBackup(currentPayload(), 'Backup9Password'))
+
+    expect(large.length).toBe(small.length)
+  })
+})
+
+describe('回滚安全：setup 失败后必须还能重试', () => {
+  it('回滚只清信封与数据体，明文表原样保留', async () => {
+    await db.txns.bulkPut([mkTxn({ id: 'legacy-x', time: '2026-01-05 09:00:00', rawType: '支出', amount: 20 })])
+
+    await discardVaultRecords()
+
+    expect(await readEnvelope()).toBeNull()
+    expect(await readVaultBlob()).toBeNull()
+    // 关键：明文一条没少。加密还没被验证成功的时候清掉明文，
+    // 是这套设计里唯一真正不可挽回的失败模式。
+    expect(await db.txns.count()).toBe(1)
+  })
+
+  it('回滚之后重试是一条真能走通的路', async () => {
+    await db.txns.bulkPut([mkTxn({ id: 'legacy-x', time: '2026-01-05 09:00:00', rawType: '支出', amount: 20 })])
+    await discardVaultRecords()
+
+    await boot()
+    expect(getVaultState().status).toBe('setup')
+    expect(getVaultState().pending).toEqual({ txnCount: 1, snapshotCount: 0 })
+
+    await setupVault('Trombone7Melon')
+    expect(currentPayload().txns.map((t) => t.id)).toEqual(['legacy-x'])
+  })
+})
+
+describe('此前未被覆盖的公开接口', () => {
+  it('verifyPassword 能区分对错密码', async () => {
+    await setupVault('Trombone7Melon')
+    expect(await verifyPassword('Trombone7Melon')).toBe(true)
+    expect(await verifyPassword('Trombone7Melonn')).toBe(false)
+  })
+
+  it('vaultFacts 与 hasRecoveryCode 如实反映信封状态', async () => {
+    expect(await vaultFacts()).toEqual({ exists: false, hasRecoveryCode: false, createdAt: null })
+
+    await setupVault('Trombone7Melon')
+    const facts = await vaultFacts()
+    expect(facts.exists).toBe(true)
+    expect(facts.hasRecoveryCode).toBe(true)
+    expect(typeof facts.createdAt).toBe('number')
+    expect(await hasRecoveryCode()).toBe(true)
+  })
+
+  it('重新生成恢复码：新码可用，旧码作废', async () => {
+    const oldCode = await setupVault('Trombone7Melon')
+    await appendTxns([mkTxn({ id: 'a', time: '2026-03-01 10:00:00', rawType: '支出', amount: 9 })])
+
+    const newCode = await reissueRecoveryCode('Trombone7Melon')
+    expect(newCode).not.toBe(oldCode)
+
+    lock()
+    await expect(resetPasswordWithRecoveryCode(oldCode, 'Nettle3Pebble')).rejects.toThrow(/对不上/)
+
+    lock()
+    const thirdCode = await resetPasswordWithRecoveryCode(newCode, 'Nettle3Pebble')
+    expect(thirdCode).toHaveLength(24)
+    expect(currentPayload().txns).toHaveLength(1)
+  })
+
+  it('重新生成恢复码需要验证当前密码 —— 否则走到电脑前的人能自己留后门', async () => {
+    const oldCode = await setupVault('Trombone7Melon')
+    await expect(reissueRecoveryCode('不对的密码')).rejects.toThrow(/密码不对/)
+
+    // 密码错了就什么都没变，旧码仍然有效
+    lock()
+    await expect(resetPasswordWithRecoveryCode(oldCode, 'Nettle3Pebble')).resolves.toHaveLength(24)
+  })
+})

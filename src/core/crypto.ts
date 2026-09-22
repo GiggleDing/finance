@@ -178,6 +178,58 @@ export async function openJson<T>(key: CryptoKey, sealed: Sealed, aad: string): 
   return JSON.parse(decoder.decode(buf)) as T
 }
 
+/* ──────────────────── 带填充的封装（防长度泄漏） ──────────────────── */
+
+/**
+ * GCM **不做任何填充** —— 密文长度严格等于明文长度。
+ *
+ * 这件事有一个容易被忽略的后果：不处理的话，备份文件的大小能直接反推出条数。
+ * 实测约 414 字节/笔（含 base64 膨胀），1502 笔 ≈ 622KB，看一眼文件大小就知道
+ * 里面大概有多少条记录。对于一个会被放进网盘、私有仓库的文件来说，
+ * 「条数」本身就是关于你的信息。
+ *
+ * 所以这里把明文填充到**下一个 2 的幂**再加密：512KB~1MB 之间的所有备份在外部
+ * 看起来一模一样大，攻击者最多只能判断数量级。代价是文件变大
+ * （1502 笔从 622KB 变成 1MB）—— 对一份备份来说完全可以忽略。
+ *
+ * 编码方式是「4 字节大端长度前缀 + JSON 字节 + 零填充」，解开时先读长度再切片，
+ * 所以填充不影响 JSON 本身的解析，也不需要给密文加标记位。
+ *
+ * 一个容易算错的地方：GCM 会在密文末尾再追加 **16 字节认证标签**，所以
+ * `密文长度 = 填充后的明文长度 + 16`。防泄漏性质不受影响（桶仍然是离散的，
+ * 同桶负载的密文长度完全相同），但任何「密文长度是不是 2 的幂」的判断都是错的。
+ */
+
+/** 分档下限：几十条的小备份也统一长成 32KB，避免小数据集被精确识别 */
+const PAD_FLOOR = 32 * 1024
+const LEN_PREFIX = 4
+
+function paddedLength(needed: number): number {
+  let size = PAD_FLOOR
+  while (size < needed + LEN_PREFIX) size *= 2
+  return size
+}
+
+export async function sealPaddedJson(key: CryptoKey, value: unknown, aad: string): Promise<Sealed> {
+  const body = encoder.encode(JSON.stringify(value))
+  const out = new Uint8Array(paddedLength(body.length))
+  new DataView(out.buffer).setUint32(0, body.length, false)
+  out.set(body, LEN_PREFIX)
+  return seal(key, out, aad)
+}
+
+export async function openPaddedJson<T>(key: CryptoKey, sealed: Sealed, aad: string): Promise<T> {
+  const buf = await open(key, sealed, aad)
+  const view = new Uint8Array(buf)
+  if (view.length < LEN_PREFIX) throw new Error('密文长度不合法')
+
+  const bodyLength = new DataView(view.buffer, view.byteOffset, LEN_PREFIX).getUint32(0, false)
+  if (bodyLength > view.length - LEN_PREFIX) throw new Error('密文长度前缀与内容不符')
+
+  const body = view.subarray(LEN_PREFIX, LEN_PREFIX + bodyLength)
+  return JSON.parse(decoder.decode(body)) as T
+}
+
 /* ─────────────────────── 密码校验探针 ─────────────────────── */
 
 export async function makeVerifier(kek: CryptoKey): Promise<Sealed> {

@@ -184,3 +184,69 @@ describe('parseWorkbook 健壮性', () => {
     expect(r.txns).toHaveLength(2)
   })
 })
+
+/**
+ * 指纹降级路径。这是「没有 ID 列」时的唯一去重手段，也是最容易静默丢账的地方 ——
+ * 曾经只用 (时间, 类型, 金额, 账户1) 四段做键，同一个账户在同一秒的两笔同额支出
+ * 会算出同一个指纹，第二条在按 ID 去重时被当成重复丢掉。
+ */
+describe('ID 缺失时的指纹降级', () => {
+  it('逐字相同的两行也必须拿到不同的主键 —— 宁可重复导入，不能吃掉账单', async () => {
+    const same = { 时间: '2026-09-20 10:00:00', 类型: '支出', 金额: 5, 账户1: '饭卡', 备注: '咖啡' }
+    const r = await parseWorkbook(build([row(same), row(same)]))
+
+    expect(r.txns).toHaveLength(2)
+    const ids = new Set(r.txns.map((t) => t.id))
+    expect(ids.size).toBe(2)
+    // 两条都进了 txns，交给上层按 ID 去重时也不会互相吞掉
+    expect([...ids].every((id) => id.startsWith('fb'))).toBe(true)
+  })
+
+  it('同一秒同额但备注不同的两行，本来就该是两条', async () => {
+    const r = await parseWorkbook(
+      build([
+        row({ 时间: '2026-09-20 10:00:00', 类型: '支出', 金额: 5, 账户1: '饭卡', 备注: '咖啡' }),
+        row({ 时间: '2026-09-20 10:00:00', 类型: '支出', 金额: 5, 账户1: '饭卡', 备注: '酸奶' }),
+      ]),
+    )
+    expect(new Set(r.txns.map((t) => t.id)).size).toBe(2)
+  })
+
+  it('重复解析同一份文件得到完全相同的主键 —— 否则重复导入会翻倍', async () => {
+    const rows = [
+      row({ 时间: '2026-09-20 10:00:00', 类型: '支出', 金额: 5, 账户1: '饭卡', 备注: '咖啡' }),
+      row({ 时间: '2026-09-20 10:00:00', 类型: '支出', 金额: 5, 账户1: '饭卡', 备注: '咖啡' }),
+      row({ 时间: '2026-09-20 11:00:00', 类型: '收入', 金额: 100, 账户1: '招行' }),
+    ]
+    const a = await parseWorkbook(build(rows))
+    const b = await parseWorkbook(build(rows))
+    expect(a.txns.map((t) => t.id)).toEqual(b.txns.map((t) => t.id))
+  })
+
+  it('有 ID 的行一律用 ID，不参与指纹计数', async () => {
+    const r = await parseWorkbook(
+      build([
+        row({ ID: 'qj1', 时间: '2026-09-20 10:00:00', 类型: '支出', 金额: 5 }),
+        row({ 时间: '2026-09-20 10:00:00', 类型: '支出', 金额: 5 }),
+      ]),
+    )
+    expect(r.txns[0].id).toBe('qj1')
+    expect(r.fingerprinted).toBe(1)
+  })
+
+  it('报告降级行数，让用户知道去重保护正在打折', async () => {
+    const r = await parseWorkbook(
+      build([
+        row({ ID: 'qj1', 时间: '2026-09-20 10:00:00', 类型: '支出', 金额: 5 }),
+        row({ 时间: '2026-09-20 11:00:00', 类型: '支出', 金额: 6 }),
+        row({ 时间: '2026-09-20 12:00:00', 类型: '支出', 金额: 7 }),
+      ]),
+    )
+    expect(r.fingerprinted).toBe(2)
+
+    const clean = await parseWorkbook(
+      build([row({ ID: 'qj9', 时间: '2026-09-20 10:00:00', 类型: '支出', 金额: 5 })]),
+    )
+    expect(clean.fingerprinted).toBe(0)
+  })
+})

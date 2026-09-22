@@ -16,8 +16,10 @@ import {
   normalizeRecoveryCode,
   open,
   openJson,
+  openPaddedJson,
   seal,
   sealJson,
+  sealPaddedJson,
   toB64,
   type Bytes,
 } from './crypto'
@@ -25,6 +27,7 @@ import {
   clearLegacyPlaintext,
   commitEnvelopeAndBlob,
   destroyVault,
+  discardVaultRecords,
   emptyPayload,
   normalizePayload,
   readEnvelope,
@@ -77,7 +80,16 @@ export interface VaultState {
 export interface RestoreOutcome {
   txnsInserted: number
   txnsDuplicated: number
+  /** 备份文件里带来的快照条数 */
   snapshotsRestored: number
+  /**
+   * 快照最终怎么处理的。必须回传给 UI 并说出来 ——
+   * 「备份里没快照、于是保留了本机快照」这种事一旦不说，用户就会以为
+   * 自己看到的余额来自刚恢复的那份备份。
+   */
+  snapshotsAction: 'replaced' | 'kept-local' | 'none'
+  /** snapshotsAction === 'kept-local' 时，本机被保留下来的快照条数 */
+  localSnapshotsKept: number
   importsAdded: number
 }
 
@@ -204,7 +216,9 @@ async function loadWithKey(key: CryptoKey): Promise<void> {
   }
   let data: VaultPayload
   try {
-    data = await openJson<VaultPayload>(key, blob.sealed, AAD_VAULT)
+    // 带填充解封：数据体加密时填到了 2 的幂，这样 IndexedDB 里那块密文的大小
+    // 不会直接暴露「你有多少条账单」
+    data = await openPaddedJson<VaultPayload>(key, blob.sealed, AAD_VAULT)
   } catch {
     throw new Error('数据体解密失败。如果你手工改过浏览器数据，请用备份文件恢复。')
   }
@@ -255,11 +269,14 @@ export async function setupVault(password: string): Promise<string> {
   const blob = {
     id: 'main' as const,
     updatedAt: Date.now(),
-    sealed: await sealJson(dek, payload, AAD_VAULT),
+    sealed: await sealPaddedJson(dek, payload, AAD_VAULT),
   }
   const env: VaultEnvelope = {
     id: 'main',
     version: 2,
+    // 本地信封的时间戳刻意保留到毫秒：它只存在于你自己的浏览器里，
+    // 没有任何第三方会读到它，对排查问题却有实在价值。
+    // 备份文件里的 exportedOn 反过来只精确到日 —— 那个文件是要出门的。
     createdAt: Date.now(),
     updatedAt: Date.now(),
     pw: { kdf: pwKdf, wrapped: pwWrapped, verifier },
@@ -270,11 +287,15 @@ export async function setupVault(password: string): Promise<string> {
 
   // 自检：读回来解一遍，确认刚写下的密文真的能用这把钥匙打开
   const readBack = await readVaultBlob()
-  if (!readBack) throw new Error('写入后读不回数据体，加密没有完成。明文未被删除，请重试。')
+  if (!readBack) {
+    await discardVaultRecords()
+    throw new Error('加密数据写入后读不回来，已经回滚。本机数据没有被删除，请再试一次。')
+  }
   try {
-    await openJson<VaultPayload>(dek, readBack.sealed, AAD_VAULT)
+    await openPaddedJson<VaultPayload>(dek, readBack.sealed, AAD_VAULT)
   } catch {
-    throw new Error('写入后的密文无法解开，加密没有完成。明文未被删除，请重试。')
+    await discardVaultRecords()
+    throw new Error('加密数据写入后无法解开，已经回滚。本机数据没有被删除，请再试一次。')
   }
 
   dekKey = dek
@@ -454,11 +475,41 @@ export async function vaultFacts(): Promise<{ exists: boolean; hasRecoveryCode: 
  * 反过来的话，IndexedDB 写入失败时界面会显示「已导入」而磁盘上什么都没有 ——
  * 对财务数据来说，宁可报错让用户重试，也不能给一个成功假象。
  */
-export async function persist(next: VaultPayload): Promise<void> {
+/**
+ * 写入串行化。
+ *
+ * 每次落盘都是「读当前内存快照 → 加密整块 → 写回」。如果两个操作同时在飞
+ * （用户快速连着导入两份文件就是这种情形），后启动的那个会基于**过期快照**加密，
+ * 把先完成的那次写入整个覆盖掉 —— 现象是「进度条走完了、界面也刷新了，但数据没了」。
+ *
+ * 关键点：不能只把 persist 排队，必须把每个操作的**读-改-写整段**排进队列。
+ * 快照如果是在队列外读的，排队也救不了它已经过期这个事实。
+ */
+let writeChain: Promise<unknown> = Promise.resolve()
+
+function enqueue<T>(task: () => Promise<T>): Promise<T> {
+  const run = writeChain.then(task, task)
+  // 队列本身不能被某一次失败掐断，否则后面所有写入都会静默不执行
+  writeChain = run.catch(() => undefined)
+  return run
+}
+
+/**
+ * 真正落盘：先写密文，再更新内存状态。
+ * 反过来的话，IndexedDB 写入失败时界面会显示「已导入」而磁盘上什么都没有 ——
+ * 对财务数据来说，宁可报错让用户重试，也不能给一个成功假象。
+ * 只能从队列内部调用（直接调会绕过串行化）。
+ */
+async function persistNow(next: VaultPayload): Promise<void> {
   if (!dekKey) throw new Error('保险箱未解锁。')
-  const sealed = await sealJson(dekKey, next, AAD_VAULT)
+  const sealed = await sealPaddedJson(dekKey, next, AAD_VAULT)
   await writeVaultBlob({ id: 'main', updatedAt: Date.now(), sealed })
   set({ data: next })
+}
+
+/** 对外的落盘入口（排队执行）。 */
+export function persist(next: VaultPayload): Promise<void> {
+  return enqueue(() => persistNow(next))
 }
 
 function requireData(): VaultPayload {
@@ -475,84 +526,111 @@ export function currentPayload(): VaultPayload {
  * 按 ID 去重后入库。与旧版一致：现有 ID 一次性读进内存比对，
  * 万条量级下这比逐条查库快得多。
  */
-export async function appendTxns(incoming: Txn[]): Promise<{ inserted: number; duplicated: number }> {
-  const current = requireData()
-  if (incoming.length === 0) return { inserted: 0, duplicated: 0 }
+export function appendTxns(incoming: Txn[]): Promise<{ inserted: number; duplicated: number }> {
+  return enqueue(async () => {
+    const current = requireData()
+    if (incoming.length === 0) return { inserted: 0, duplicated: 0 }
 
-  const known = new Set(current.txns.map((t) => t.id))
-  const fresh: Txn[] = []
-  for (const t of incoming) {
-    if (known.has(t.id)) continue
-    known.add(t.id)
-    fresh.push(t)
-  }
+    const known = new Set(current.txns.map((t) => t.id))
+    const fresh: Txn[] = []
+    for (const t of incoming) {
+      if (known.has(t.id)) continue
+      known.add(t.id)
+      fresh.push(t)
+    }
 
-  if (fresh.length > 0) {
-    await persist({ ...current, txns: [...current.txns, ...fresh] })
-  }
-  return { inserted: fresh.length, duplicated: incoming.length - fresh.length }
+    if (fresh.length > 0) {
+      await persistNow({ ...current, txns: [...current.txns, ...fresh] })
+    }
+    return { inserted: fresh.length, duplicated: incoming.length - fresh.length }
+  })
 }
 
-export async function addImportRecord(rec: ImportRecord): Promise<void> {
-  const current = requireData()
-  await persist({ ...current, imports: [...current.imports, rec] })
+export function addImportRecord(rec: ImportRecord): Promise<void> {
+  return enqueue(async () => {
+    const current = requireData()
+    await persistNow({ ...current, imports: [...current.imports, rec] })
+  })
 }
 
 /**
  * 快照是整表覆盖，不是追加。
  * 它代表「此刻各账户是多少钱」这一份状态，没有历史版本语义。
  */
-export async function replaceSnapshots(list: AccountSnapshot[]): Promise<void> {
-  const current = requireData()
-  await persist({ ...current, snapshots: list })
+export function replaceSnapshots(list: AccountSnapshot[]): Promise<void> {
+  return enqueue(async () => {
+    const current = requireData()
+    await persistNow({ ...current, snapshots: list })
+  })
 }
 
 /**
- * 从备份恢复。采用**合并**而非覆盖：流水按 ID 补齐、快照整表覆盖、
- * 导入记录按「文件名 + 导入时间」去重追加。
+ * 从备份恢复。流水按 ID **合并**而不是覆盖 ——
  * 覆盖式恢复会让「恢复一份旧备份把新账冲掉」成为可能，这个坑不能踩。
  */
-export async function mergeFromBackup(payload: VaultPayload): Promise<RestoreOutcome> {
-  const current = requireData()
+export function mergeFromBackup(payload: VaultPayload): Promise<RestoreOutcome> {
+  return enqueue(async () => {
+    const current = requireData()
 
-  const known = new Set(current.txns.map((t) => t.id))
-  const freshTxns: Txn[] = []
-  for (const t of payload.txns) {
-    if (known.has(t.id)) continue
-    known.add(t.id)
-    freshTxns.push(t)
-  }
+    const known = new Set(current.txns.map((t) => t.id))
+    const freshTxns: Txn[] = []
+    for (const t of payload.txns) {
+      if (known.has(t.id)) continue
+      known.add(t.id)
+      freshTxns.push(t)
+    }
 
-  const seenImports = new Set(current.imports.map((r) => `${r.fileName}|${r.importedAt}`))
-  const freshImports = payload.imports.filter((r) => !seenImports.has(`${r.fileName}|${r.importedAt}`))
+    const seenImports = new Set(current.imports.map((r) => `${r.fileName}|${r.importedAt}`))
+    const freshImports = payload.imports.filter((r) => !seenImports.has(`${r.fileName}|${r.importedAt}`))
 
-  const snapshots = payload.snapshots.length > 0 ? payload.snapshots : current.snapshots
+    /*
+     * 快照只有两种干净语义：「备份里有 → 整表覆盖」和「备份里没有 → 本机原样不动」。
+     * 危险的是第三种 —— 偷偷选一个还不告诉用户。那会造出一个很难发现的假象：
+     * 你以为看到的是旧电脑上那份余额，其实是新电脑上的。这个项目在「资产总览」上
+     * 最忌讳的就是这种自我欺骗，所以结果必须显式回传给 UI，让它说出来。
+     */
+    let snapshots = current.snapshots
+    let snapshotsAction: RestoreOutcome['snapshotsAction'] = 'none'
+    let localSnapshotsKept = 0
+    if (payload.snapshots.length > 0) {
+      snapshots = payload.snapshots.map((s) => ({ ...s, id: undefined }))
+      snapshotsAction = 'replaced'
+    } else if (current.snapshots.length > 0) {
+      localSnapshotsKept = current.snapshots.length
+      snapshotsAction = 'kept-local'
+    }
 
-  await persist({
-    txns: [...current.txns, ...freshTxns],
-    snapshots: snapshots.map((s) => ({ ...s, id: undefined })),
-    imports: [...current.imports, ...freshImports],
+    await persistNow({
+      txns: [...current.txns, ...freshTxns],
+      snapshots,
+      imports: [...current.imports, ...freshImports],
+    })
+
+    return {
+      txnsInserted: freshTxns.length,
+      txnsDuplicated: payload.txns.length - freshTxns.length,
+      snapshotsRestored: payload.snapshots.length,
+      snapshotsAction,
+      localSnapshotsKept,
+      importsAdded: freshImports.length,
+    }
   })
-
-  return {
-    txnsInserted: freshTxns.length,
-    txnsDuplicated: payload.txns.length - freshTxns.length,
-    snapshotsRestored: snapshots.length,
-    importsAdded: freshImports.length,
-  }
 }
 
 /** 清空账面数据，但保留保险箱、密码、恢复码 —— 目的是重新导入而非放弃加密。 */
-export async function wipeVaultData(): Promise<void> {
-  await persist(emptyPayload())
+export function wipeVaultData(): Promise<void> {
+  return enqueue(() => persistNow(emptyPayload()))
 }
 
 /** 连保险箱一起拆掉，回到「首次设置密码」。不可撤销。 */
-export async function destroyEverything(): Promise<void> {
-  await destroyVault()
-  dekKey = null
-  forgetSession()
-  set({ ...INITIAL, status: 'setup' })
+export function destroyEverything(): Promise<void> {
+  // 走队列：不要和一个正在飞行的写入抢同一块数据
+  return enqueue(async () => {
+    await destroyVault()
+    dekKey = null
+    forgetSession()
+    set({ ...INITIAL, status: 'setup' })
+  })
 }
 
 /* ───────────────────────── 工具 ───────────────────────── */

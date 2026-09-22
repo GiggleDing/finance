@@ -299,8 +299,18 @@ function RestoreDialog({
       }
 
       const outcome = await mergeFromBackup(opened.payload)
+
+      // 快照的处理结果必须原样说出来。尤其是「备份里没快照、于是保留了本机那份」——
+      // 不说的话，用户会以为自己看到的余额是从这份备份恢复来的。
+      const snapshotNote =
+        outcome.snapshotsAction === 'replaced'
+          ? `账户快照按备份里的 ${outcome.snapshotsRestored} 条整份替换。`
+          : outcome.snapshotsAction === 'kept-local'
+            ? `注意：这份备份里没有账户快照，所以本机原有的 ${outcome.localSnapshotsKept} 条余额保持不动 —— 它们不是从这份备份恢复来的。`
+            : '两边都没有账户快照。'
+
       onDone(
-        `恢复完成：新增 ${outcome.txnsInserted} 笔（跳过重复 ${outcome.txnsDuplicated} 笔），账户快照 ${outcome.snapshotsRestored} 条。` +
+        `恢复完成：新增 ${outcome.txnsInserted} 笔流水（跳过重复 ${outcome.txnsDuplicated} 笔）。${snapshotNote}` +
           (opened.legacy ? ' 原文件是明文备份，请记得删除它。' : ''),
       )
     } catch (e) {
@@ -347,7 +357,9 @@ function RestoreDialog({
       )}
 
       <p className="text-2xs text-ink-400 leading-relaxed">
-        恢复采用<b>合并</b>而不是覆盖：流水按账单 ID 补齐，已有的不会重复；账户快照会被备份里的版本整份替换。
+        恢复采用<b>合并</b>而不是覆盖：流水按账单 ID 补齐，已有的不会重复。
+        账户快照只有「备份里有 → 整份替换」和「备份里没有 → 本机原样不动」两种结果，
+        恢复完会明确告诉你走的是哪一种。
       </p>
 
       {error && <ErrorAlert>{error}</ErrorAlert>}

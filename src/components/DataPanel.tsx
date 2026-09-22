@@ -150,6 +150,13 @@ export function DataPanel({ txns }: { txns: Txn[] }) {
               <MiniStat label="跳过重复" value={String(report.duplicated)} />
               <MiniStat label="异常跳过" value={String(report.parse.skipped)} tone={report.parse.skipped > 0 ? 'alert' : undefined} />
             </div>
+            {report.parse.fingerprinted > 0 && (
+              <p className="text-2xs text-[#8A6412] mt-3">
+                这份文件里有 {report.parse.fingerprinted} 行没有账单 ID，只能用「内容指纹」当主键。
+                指纹的去重能力不如钱迹自带的 ID：如果两份账单在时间、金额、账户、分类、备注上
+                完全一样，它们会被视为同一条。如果你的钱迹导出可以带上 ID 列，建议改用那种方式。
+              </p>
+            )}
             {report.parse.unknownTypes.length > 0 && (
               <p className="text-2xs text-expense mt-3">
                 钱迹里出现了本系统还不认识的类型：{report.parse.unknownTypes.join('、')}。这些账单已入库但未计入收支，
