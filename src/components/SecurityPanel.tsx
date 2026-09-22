@@ -9,11 +9,11 @@ import {
 } from '../core/backup'
 import {
   changePassword,
-  currentPayload,
   destroyEverything,
   hasRecoveryCode,
   mergeFromBackup,
   reissueRecoveryCode,
+  snapshotPayload,
   verifyPassword,
   vaultFacts,
 } from '../core/session'
@@ -221,9 +221,14 @@ function ExportDialog({ txns, onClose, onDone }: { txns: Txn[]; onClose: () => v
         throw new Error('给这个备份单独设的密码也至少要 8 位。')
       }
 
-      const backup = await buildEncryptedBackup(currentPayload(), password)
+      // 必须用队列内快照：currentPayload() 读的是 state.data，而它要等密文落盘成功
+      // 才更新。若此刻有导入在飞，导出的备份会静默少掉那一批 —— 对备份来说这是最坏的错。
+      const payload = await snapshotPayload()
+      const backup = await buildEncryptedBackup(payload, password)
       const name = downloadEncryptedBackup(backup)
-      onDone(`已导出 ${name}，包含 ${txns.length} 笔流水。这个文件是加密的，放到网盘或私有仓库都可以，但请记住打开它的密码。`)
+      onDone(
+        `已导出 ${name}，包含 ${payload.txns.length} 笔流水。这个文件是加密的，放到网盘或私有仓库都可以，但请记住打开它的密码。`,
+      )
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {

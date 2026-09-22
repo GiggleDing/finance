@@ -29,6 +29,7 @@ import {
   replaceSnapshots,
   resetPasswordWithRecoveryCode,
   setupVault,
+  snapshotPayload,
   unlock,
   vaultFacts,
   verifyPassword,
@@ -708,5 +709,60 @@ describe('此前未被覆盖的公开接口', () => {
     // 密码错了就什么都没变，旧码仍然有效
     lock()
     await expect(resetPasswordWithRecoveryCode(oldCode, 'Nettle3Pebble')).resolves.toHaveLength(24)
+  })
+})
+
+/**
+ * 独立验证查出的两处「队列外」读写。
+ *
+ * 两处的共同点是：写入确实排了队，但**读**还在队列外面，于是排队保护不到它 ——
+ * 一个会拿到过期快照，一个会写回已经作废的旧副本。这类缺陷不会让测试变红，
+ * 只会让用户在某次特定时序下静默地少数据，所以必须专门钉住。
+ */
+describe('队列外读写的回归', () => {
+  it('飞行写入期间取快照：必须看到刚写入的那批（导出备份用的是它）', async () => {
+    await setupVault('Trombone7Melon')
+
+    // 不 await 写入就立刻取快照 —— 相当于「刚导完一批账单，马上点导出备份」。
+    // 若快照在队列外读 state.data，而 state.data 要等密文落盘成功才更新，
+    // 导出的备份就会静默少掉这一批；备份是数据丢失时的最后防线，少一批比报错严重。
+    const [written, snapshot] = await Promise.all([
+      appendTxns([mkTxn({ id: 'p1', time: '2026-03-01 10:00:00', rawType: '支出', amount: 1 })]),
+      snapshotPayload(),
+    ])
+
+    expect(written.inserted).toBe(1)
+    expect(snapshot.txns.map((t) => t.id)).toEqual(['p1'])
+  })
+
+  it('快照是「排队那一刻」的切面：之前的写入在里面，之后的写入不在里面', async () => {
+    await setupVault('Trombone7Melon')
+
+    const before = appendTxns([mkTxn({ id: 'before', time: '2026-03-01 10:00:00', rawType: '支出', amount: 1 })])
+    const snap = snapshotPayload()
+    const after = appendTxns([mkTxn({ id: 'after', time: '2026-03-02 10:00:00', rawType: '支出', amount: 2 })])
+
+    expect((await snap).txns.map((t) => t.id)).toEqual(['before'])
+    // 三件事都做完之后，库里必须是两条都在
+    await Promise.all([before, after])
+    expect(currentPayload().txns.map((t) => t.id).sort()).toEqual(['after', 'before'])
+  })
+
+  it('改密码与拆箱并发：绝不能留下「信封在、数据体不在」的残缺状态', async () => {
+    await setupVault('Trombone7Melon')
+
+    /*
+     * 改密码在读到信封之后还要跑两次 PBKDF2（几百毫秒），拆箱就在这段窗口里
+     * 把 meta / vault 两张表清掉。如果改密码写回的是函数开头读到的那份旧信封，
+     * 就会只把信封写回来、数据体已经没了 —— 下次启动直接进 broken 态，
+     * 而用户只是改了个密码。正确行为是发现保险箱已不存在就拒绝写入。
+     */
+    await Promise.allSettled([changePassword('Trombone7Melon', 'Nettle3Pebble'), destroyEverything()])
+
+    const [env, blob] = await Promise.all([readEnvelope(), readVaultBlob()])
+    expect(Boolean(env)).toBe(Boolean(blob))
+
+    await boot()
+    expect(status()).not.toBe('broken')
   })
 })

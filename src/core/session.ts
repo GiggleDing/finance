@@ -283,27 +283,31 @@ export async function setupVault(password: string): Promise<string> {
     rc: { kdf: rcKdf, wrapped: rcWrapped },
   }
 
-  await commitEnvelopeAndBlob(env, blob)
+  // 信封与数据体的写入走同一条队列：它们和 destroyEverything 动的是同一对表，
+  // 分开排队就留下一个「提交到一半被清库」的交错窗口。
+  await enqueue(async () => {
+    await commitEnvelopeAndBlob(env, blob)
 
-  // 自检：读回来解一遍，确认刚写下的密文真的能用这把钥匙打开
-  const readBack = await readVaultBlob()
-  if (!readBack) {
-    await discardVaultRecords()
-    throw new Error('加密数据写入后读不回来，已经回滚。本机数据没有被删除，请再试一次。')
-  }
-  try {
-    await openPaddedJson<VaultPayload>(dek, readBack.sealed, AAD_VAULT)
-  } catch {
-    await discardVaultRecords()
-    throw new Error('加密数据写入后无法解开，已经回滚。本机数据没有被删除，请再试一次。')
-  }
+    // 自检：读回来解一遍，确认刚写下的密文真的能用这把钥匙打开
+    const readBack = await readVaultBlob()
+    if (!readBack) {
+      await discardVaultRecords()
+      throw new Error('加密数据写入后读不回来，已经回滚。本机数据没有被删除，请再试一次。')
+    }
+    try {
+      await openPaddedJson<VaultPayload>(dek, readBack.sealed, AAD_VAULT)
+    } catch {
+      await discardVaultRecords()
+      throw new Error('加密数据写入后无法解开，已经回滚。本机数据没有被删除，请再试一次。')
+    }
+
+    // 到这一步密文才算真的成立，此时清明文不是「赌它还活着」，而是「确认它已经安全」
+    await clearLegacyPlaintext()
+  })
 
   dekKey = dek
   rememberInSession(rawDek)
   set({ status: 'unlocked', data: payload, pending: null, freshRecoveryCode: recoveryCode, error: null })
-
-  // 到这一步密文才算真的成立，此时清明文不是「赌它还活着」，而是「确认它已经安全」
-  await clearLegacyPlaintext()
   return recoveryCode
 }
 
@@ -368,11 +372,11 @@ export async function changePassword(currentPassword: string, nextPassword: stri
   const nextWrapped = await seal(nextKek, rawDek, AAD_DEK)
   const nextVerifier = await makeVerifier(nextKek)
 
-  await writeEnvelope({
-    ...env,
-    updatedAt: Date.now(),
+  // 走 rewriteEnvelope：它在队列内重读信封，避免把已被清空的保险箱写回来
+  await rewriteEnvelope((live) => ({
+    ...live,
     pw: { kdf: nextKdf, wrapped: nextWrapped, verifier: nextVerifier },
-  })
+  }))
 }
 
 /**
@@ -416,12 +420,11 @@ export async function resetPasswordWithRecoveryCode(
   const rcKekNew = await deriveKek(freshCode, rcKdf)
   const rcWrapped = await seal(rcKekNew, rawDek, AAD_DEK)
 
-  await writeEnvelope({
-    ...env,
-    updatedAt: Date.now(),
+  await rewriteEnvelope((live) => ({
+    ...live,
     pw: { kdf: nextKdf, wrapped: pwWrapped, verifier },
     rc: { kdf: rcKdf, wrapped: rcWrapped },
-  })
+  }))
 
   // 重置的终点必须是「人已经进去了」。只换信封不打开数据体的话，
   // 用户会在输完恢复码和新密码之后被弹回锁屏，以为自己弄错了。
@@ -452,7 +455,7 @@ export async function reissueRecoveryCode(currentPassword: string): Promise<stri
   const rcKek = await deriveKek(freshCode, rcKdf)
   const rcWrapped = await seal(rcKek, rawDek, AAD_DEK)
 
-  await writeEnvelope({ ...env, updatedAt: Date.now(), rc: { kdf: rcKdf, wrapped: rcWrapped } })
+  await rewriteEnvelope((live) => ({ ...live, rc: { kdf: rcKdf, wrapped: rcWrapped } }))
   set({ freshRecoveryCode: freshCode, error: null })
   return freshCode
 }
@@ -512,6 +515,24 @@ export function persist(next: VaultPayload): Promise<void> {
   return enqueue(() => persistNow(next))
 }
 
+/**
+ * 在队列内**重读并重写**信封。
+ *
+ * 调用方在函数开头读到的那份信封不能直接拿来写回：从读到写之间隔着一次
+ * PBKDF2（几百毫秒），期间 destroyEverything 完全可能已经把两张表清掉。
+ * 照旧写回开头那份旧信封，就会造出一个「信封在、数据体不在」的残缺状态 ——
+ * 下次启动直接进 broken，而用户只是改了个密码。
+ *
+ * 所以老实重读一次：还在就改，没了就拒绝，绝不把已删掉的保险箱复活回来。
+ */
+function rewriteEnvelope(patch: (live: VaultEnvelope) => VaultEnvelope): Promise<void> {
+  return enqueue(async () => {
+    const live = await readEnvelope()
+    if (!live) throw new Error('保险箱已经不存在了（可能刚刚被清空）。本次改动没有生效。')
+    await writeEnvelope({ ...patch(live), updatedAt: Date.now() })
+  })
+}
+
 function requireData(): VaultPayload {
   if (!dekKey || !state.data) throw new Error('保险箱未解锁。')
   return state.data
@@ -520,6 +541,21 @@ function requireData(): VaultPayload {
 /** 供备份等只读场景使用。未解锁时抛错，调用方必须处理。 */
 export function currentPayload(): VaultPayload {
   return requireData()
+}
+
+/**
+ * 只读快照的**队列内**版本。导出备份必须走它，不要用 currentPayload()。
+ *
+ * 原因是这两者在并发下不等价：`currentPayload()` 直接读 `state.data`，而 `state.data`
+ * 是在密文写盘**成功之后**才更新的。如果此刻正有一次导入在飞，导出拿到的就是
+ * 更新前的旧快照 —— 现象是「刚导完一批账单，立刻导出的备份里却没有这批」。
+ * 备份是数据丢失时的最后一道防线，它少一批比它报错严重得多。
+ *
+ * 排进队列之后语义变得干净：它一定在「此前排入的所有写入」之后执行，
+ * 晚于它排入的写入则排在它后面，所以拿到的是一个真正一致的时点快照。
+ */
+export function snapshotPayload(): Promise<VaultPayload> {
+  return enqueue(async () => requireData())
 }
 
 /**
