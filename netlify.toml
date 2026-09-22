@@ -1,0 +1,50 @@
+# Netlify 部署配置。
+#
+# 为什么换到这里：GitHub Pages 的隔离粒度是「每个账号一个源」，同账号下所有启用
+# Pages 的仓库彼此同源，于是 sessionStorage / IndexedDB 是互通的。换到独立源之后，
+# 这个应用的数据只躺在一个自己独占的源里，同源兄弟站这条通路才算真正断掉。
+#
+# 另一个白捡的好处：这里能设**真正的 HTTP 响应头**。GitHub Pages 不行，
+# 所以那边只能把 CSP 塞进 <meta>，而 frame-ancestors 写在 meta 里浏览器直接忽略
+# —— 也就是点击劫持那条一直防不住。下面用响应头补上。
+
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+[build.environment]
+  # 与本地开发保持一致的 Node 大版本，避免 CI 上因为 Node 差异装不上依赖
+  NODE_VERSION = "22"
+
+# ── 安全响应头 ──────────────────────────────────────────────────────────
+# 与 index.html 里由 vite 注入的 <meta> CSP 内容一致，另外补上只在响应头里
+# 才生效的 frame-ancestors。两条同时存在时浏览器取交集，不会互相放宽。
+[[headers]]
+  for = "/*"
+  [headers.values]
+    Content-Security-Policy = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    X-Frame-Options = "DENY"
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "no-referrer"
+    Permissions-Policy = "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()"
+    # 这个应用完全不与外站通信（已全量核查过零外联），所以可以放心收紧
+    Cross-Origin-Opener-Policy = "same-origin"
+    Cross-Origin-Resource-Policy = "same-origin"
+    # 纯静态站点，强制 HTTPS 没有副作用
+    Strict-Transport-Security = "max-age=31536000; includeSubDomains"
+
+# ── 缓存 ────────────────────────────────────────────────────────────────
+# 产物文件名带内容哈希，可以放心长缓存；入口 html 绝不能长缓存，
+# 否则改版后用户会一直拿到指向上一个版本资源的旧页面。
+[[headers]]
+  for = "/assets/*"
+  [headers.values]
+    Cache-Control = "public, max-age=31536000, immutable"
+
+[[headers]]
+  for = "/index.html"
+  [headers.values]
+    Cache-Control = "no-cache"
+
+# 这个应用没有前端路由（单页切标签，不换路径），所以不需要 SPA 回退重写。
+# 刻意不加 catch-all 200 重写：它会把真实的 404 也伪装成 200，反而更难排查。
