@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react'
 import type { AccountSnapshot, Txn } from '../types'
 import { buildInsights } from '../core/insights'
 import { monthlyFlows, totals } from '../core/stats'
-import { saveSnapshots } from '../core/db'
+import { replaceSnapshots } from '../core/session'
 import { groupOfAccount } from '../core/classify'
 import { Badge, Button, Card, CardHeader, Stat } from './ui'
 import { fmtMoney, fmtYm, pct } from '../utils/format'
@@ -35,12 +35,10 @@ function emptyDraft(): Draft {
 export function Overview({
   txns,
   snapshots,
-  reload,
   onGoData,
 }: {
   txns: Txn[]
   snapshots: AccountSnapshot[]
-  reload: () => Promise<void>
   onGoData: () => void
 }) {
   const agg = useMemo(() => totals(txns), [txns])
@@ -79,8 +77,7 @@ export function Overview({
           group: groupOfAccount(d.name),
           includeInNet: d.includeInNet,
         }))
-      await saveSnapshots(cleaned)
-      await reload()
+      await replaceSnapshots(cleaned)
       setEditing(false)
     } finally {
       setSaving(false)

@@ -1,8 +1,8 @@
 import { useRef, useState } from 'react'
 import type { Txn } from '../types'
 import { parseWorkbook, type ParseResult } from '../core/parse'
-import { importTxns, recordImport, wipeAll } from '../core/db'
-import { buildBackup, downloadBackup, restoreBackup } from '../core/backup'
+import { addImportRecord, appendTxns, wipeVaultData } from '../core/session'
+import { SecurityPanel } from './SecurityPanel'
 import { totals } from '../core/stats'
 import { Badge, Button, Card, CardHeader } from './ui'
 import { fmtMoney, fmtNum, kindLabel } from '../utils/format'
@@ -14,7 +14,7 @@ interface ImportReport {
   duplicated: number
 }
 
-export function DataPanel({ txns, reload }: { txns: Txn[]; reload: () => Promise<void> }) {
+export function DataPanel({ txns }: { txns: Txn[] }) {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [report, setReport] = useState<ImportReport | null>(null)
@@ -23,7 +23,6 @@ export function DataPanel({ txns, reload }: { txns: Txn[]; reload: () => Promise
   const [dragOver, setDragOver] = useState(false)
 
   const fileRef = useRef<HTMLInputElement>(null)
-  const restoreRef = useRef<HTMLInputElement>(null)
 
   const agg = totals(txns)
 
@@ -45,8 +44,11 @@ export function DataPanel({ txns, reload }: { txns: Txn[]; reload: () => Promise
         throw new Error('文件里没有解析出任何账单，请确认导出时选择了账单数据而不是空账本。')
       }
 
-      const outcome = await importTxns(parse.txns)
-      await recordImport({
+      // 注意顺序：先把流水加密落盘，再写导入留痕。
+      // 万一第二步失败，最坏情况只是少了条日志，账单本身是完整的；
+      // 反过来则会出现「日志显示导入过、但流水不在库里」这种对不上账的状态。
+      const outcome = await appendTxns(parse.txns)
+      await addImportRecord({
         fileName: file.name,
         importedAt: Date.now(),
         totalRows: parse.totalRows,
@@ -58,7 +60,6 @@ export function DataPanel({ txns, reload }: { txns: Txn[]; reload: () => Promise
           ...(parse.unknownTypes.length > 0 ? [`未识别的类型：${parse.unknownTypes.join('、')}`] : []),
         ],
       })
-      await reload()
       setReport({ fileName: file.name, parse, inserted: outcome.inserted, duplicated: outcome.duplicated })
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -68,47 +69,14 @@ export function DataPanel({ txns, reload }: { txns: Txn[]; reload: () => Promise
     }
   }
 
-  async function handleBackupDownload() {
-    setBusy(true)
-    setError(null)
-    try {
-      const backup = await buildBackup()
-      const name = downloadBackup(backup)
-      setNotice(`已导出 ${name}，包含 ${backup.txnCount} 笔流水、${backup.snapshotCount} 条账户快照。`)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  async function handleRestore(file: File) {
-    setBusy(true)
-    setError(null)
-    setNotice(null)
-    try {
-      const r = await restoreBackup(file)
-      await reload()
-      setNotice(
-        `恢复完成：新增 ${r.txnsInserted} 笔（跳过重复 ${r.txnsDuplicated} 笔），账户快照 ${r.snapshotsRestored} 条。`,
-      )
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setBusy(false)
-      if (restoreRef.current) restoreRef.current.value = ''
-    }
-  }
-
   async function handleWipe() {
     setBusy(true)
     setError(null)
     try {
-      await wipeAll()
-      await reload()
+      await wipeVaultData()
       setReport(null)
       setConfirmWipe(false)
-      setNotice('本地数据已清空。')
+      setNotice('账面数据已清空。保险箱和密码都还在，可以直接导入新账单。')
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -256,34 +224,14 @@ export function DataPanel({ txns, reload }: { txns: Txn[]; reload: () => Promise
         </Card>
       )}
 
-      <Card>
-        <CardHeader
-          title="备份与恢复"
-          desc="数据只存在这台设备的浏览器里。清缓存、换电脑、换浏览器都会导致数据消失，因此每次导入后请导出一份备份。"
-        />
-        <div className="px-4 pb-4 flex flex-wrap gap-2">
-          <Button variant="primary" onClick={() => void handleBackupDownload()} disabled={busy || txns.length === 0}>
-            导出备份（JSON）
-          </Button>
-          <Button onClick={() => restoreRef.current?.click()} disabled={busy}>
-            从备份恢复
-          </Button>
-          <input
-            ref={restoreRef}
-            type="file"
-            accept=".json"
-            className="hidden"
-            onChange={(e) => {
-              const f = e.target.files?.[0]
-              if (f) void handleRestore(f)
-            }}
-          />
-        </div>
-      </Card>
+      <SecurityPanel txns={txns} />
 
       {txns.length > 0 && (
         <Card>
-          <CardHeader title="清空本地数据" desc="删除后无法撤销，除非你手上有备份文件。" />
+          <CardHeader
+            title="清空账面数据"
+            desc="删掉全部流水和账户快照，但保险箱、密码、恢复码都保留 —— 适合重新导入一遍。删除后无法撤销，除非你手上有备份文件。"
+          />
           <div className="px-4 pb-4">
             {confirmWipe ? (
               <div className="flex flex-wrap items-center gap-2">
